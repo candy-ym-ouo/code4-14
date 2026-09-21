@@ -138,3 +138,54 @@ export const movementLabels: Record<string, string> = {
   ADJUSTMENT_OUT: "盘减",
   REVERSAL: "撤销恢复"
 };
+
+export const voucherStatusLabels: Record<string, string> = {
+  DRAFT: "待补录",
+  ACTIVE: "有效",
+  SUPERSEDED: "已被新版本取代",
+  REVERSED: "已红冲",
+  CONFIRMED: "已确认结转"
+};
+
+export const voucherStatusTypes: Record<string, "info" | "success" | "warning" | "danger" | "primary"> = {
+  DRAFT: "warning",
+  ACTIVE: "success",
+  SUPERSEDED: "info",
+  REVERSED: "danger",
+  CONFIRMED: "primary"
+};
+
+export type CostVoucher = {
+  id: string;
+  rootVoucherId: string;
+  supersedesVoucherId: string | null;
+  version: number;
+  eventType: "CONSUMPTION" | "REVERSAL";
+  consumptionId: string;
+  projectId: string;
+  batchId: string;
+  projectName: string;
+  materialName: string;
+  batchCode: string | null;
+  status: "DRAFT" | "ACTIVE" | "SUPERSEDED" | "REVERSED" | "CONFIRMED";
+  usedQuantity: string;
+  wasteQuantity: string;
+  totalQuantity: string;
+  unitCostOrig: string;
+  usedCostOrig: string;
+  wasteCostOrig: string;
+  totalCostOrig: string;
+  currency: string | null;
+  exchangeRate: string | null;
+  exchangeRateDate: string | null;
+  unitCostBase: string;
+  usedCostBase: string;
+  wasteCostBase: string;
+  totalCostBase: string;
+  baseCurrency: string;
+  basis: unknown;
+  remark: string | null;
+  confirmedAt: string | null;
+  createdAt: string;
+  createdByName: string;
+};

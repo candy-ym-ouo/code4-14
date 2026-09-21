@@ -135,7 +135,7 @@ export async function insightRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.get("/exports/workspace.json", async (_request, reply) => {
-    const [sources, locations, materials, batches, movements, projects, requirements, consumptions, colorChanges, attachments, auditLogs] = await Promise.all([
+    const [sources, locations, materials, batches, movements, projects, requirements, consumptions, colorChanges, attachments, auditLogs, currencyRates, costAdjustments, costVouchers, costingSettings] = await Promise.all([
       pool.query("SELECT * FROM sources ORDER BY created_at"),
       pool.query("SELECT * FROM storage_locations ORDER BY created_at"),
       pool.query("SELECT * FROM materials ORDER BY created_at"),
@@ -146,12 +146,16 @@ export async function insightRoutes(app: FastifyInstance): Promise<void> {
       pool.query("SELECT * FROM consumptions ORDER BY created_at"),
       pool.query("SELECT * FROM color_changes ORDER BY created_at"),
       pool.query("SELECT * FROM attachments ORDER BY created_at"),
-      pool.query("SELECT * FROM audit_logs ORDER BY created_at")
+      pool.query("SELECT * FROM audit_logs ORDER BY created_at"),
+      pool.query("SELECT * FROM currency_rates ORDER BY effective_from, created_at"),
+      pool.query("SELECT * FROM batch_cost_adjustments ORDER BY created_at"),
+      pool.query("SELECT * FROM material_cost_vouchers ORDER BY created_at, version"),
+      pool.query("SELECT * FROM costing_settings WHERE id = true")
     ]);
     reply.header("Content-Disposition", `attachment; filename="handcraft-workspace-${new Date().toISOString().slice(0, 10)}.json"`);
     return reply.send({
       exportedAt: new Date().toISOString(),
-      schemaVersion: 1,
+      schemaVersion: 2,
       sources: sources.rows,
       locations: locations.rows,
       materials: materials.rows,
@@ -162,7 +166,11 @@ export async function insightRoutes(app: FastifyInstance): Promise<void> {
       consumptions: consumptions.rows,
       colorChanges: colorChanges.rows,
       attachments: attachments.rows,
-      auditLogs: auditLogs.rows
+      auditLogs: auditLogs.rows,
+      costingSettings: costingSettings.rows,
+      currencyRates: currencyRates.rows,
+      batchCostAdjustments: costAdjustments.rows,
+      materialCostVouchers: costVouchers.rows
     });
   });
 }

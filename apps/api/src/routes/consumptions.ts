@@ -7,6 +7,7 @@ import { pageMeta, parsePagination } from "../lib/pagination.js";
 import { parseInput } from "../lib/validation.js";
 import { writeAudit } from "../lib/audit.js";
 import { getIdempotencyKey } from "../lib/idempotency.js";
+import { refreshVoucherChain } from "../lib/costingService.js";
 
 type Query = Record<string, string | undefined>;
 
@@ -137,11 +138,16 @@ export async function consumptionRoutes(app: FastifyInstance): Promise<void> {
         id: string;
         material_id: string;
         material_name: string;
+        initial_quantity: string;
+        total_cost: string | null;
+        currency: string | null;
         remaining_quantity: string;
         stock_unit: string;
         status: string;
       }>(
-        `SELECT b.id, b.material_id, m.name AS material_name, b.remaining_quantity, b.stock_unit, b.status
+        `SELECT b.id, b.material_id, m.name AS material_name, b.initial_quantity::text AS initial_quantity,
+                b.total_cost::text AS total_cost, b.currency, b.remaining_quantity::text AS remaining_quantity,
+                b.stock_unit, b.status
            FROM batches b JOIN materials m ON m.id = b.material_id
           WHERE b.id = $1 FOR UPDATE OF b`,
         [input.batchId]
@@ -196,12 +202,39 @@ export async function consumptionRoutes(app: FastifyInstance): Promise<void> {
         "UPDATE batches SET remaining_quantity = $1, status = $2, version = version + 1 WHERE id = $3",
         [after, compareQuantities(after, "0") === 0 ? "DEPLETED" : "ACTIVE", batch.id]
       );
+      const costVoucher = await refreshVoucherChain(client, {
+        consumption: {
+          id: consumptionId!,
+          projectId: input.projectId,
+          batchId: batch.id,
+          usedQuantity,
+          wasteQuantity,
+          totalQuantity
+        },
+        valueDate: new Date(consumption.rows[0]!.consumedAt as string).toISOString().slice(0, 10),
+        batchInfo: {
+          initialQuantity: batch.initial_quantity,
+          remainingBefore: before,
+          totalCost: batch.total_cost,
+          currency: batch.currency
+        },
+        actorUserId: user.id,
+        requestId: request.id,
+        action: "CREATE"
+      });
       await writeAudit(client, {
         actorUserId: user.id, action: "CONSUME", entityType: "CONSUMPTION", entityId: consumptionId,
-        afterData: { ...consumption.rows[0], beforeQuantity: before, afterQuantity: after, autoStartedProject },
+        afterData: {
+          ...consumption.rows[0],
+          beforeQuantity: before,
+          afterQuantity: after,
+          autoStartedProject,
+          costVoucherId: costVoucher.voucher?.id,
+          costVoucherStatus: costVoucher.voucher?.status
+        },
         requestId: request.id
       });
-      return { ...consumption.rows[0], idempotent: false };
+      return { ...consumption.rows[0], costVoucherStatus: costVoucher.voucher?.status, idempotent: false };
     });
     return reply.status(created.idempotent ? 200 : 201).send({ data: created });
   });
@@ -213,14 +246,24 @@ export async function consumptionRoutes(app: FastifyInstance): Promise<void> {
       const result = await client.query<{
         id: string;
         batch_id: string;
+        project_id: string;
         material_id: string;
+        used_quantity: string;
+        waste_quantity: string;
         total_quantity: string;
         stock_unit: string;
         status: string;
+        consumed_at: string;
+        initial_quantity: string;
+        total_cost: string | null;
+        currency: string | null;
         remaining_quantity: string;
       }>(
-        `SELECT c.id, c.batch_id, b.material_id, c.total_quantity, c.stock_unit, c.status,
-                b.remaining_quantity, b.status AS batch_status
+        `SELECT c.id, c.batch_id, c.project_id, b.material_id,
+                c.used_quantity::text AS used_quantity, c.waste_quantity::text AS waste_quantity,
+                c.total_quantity::text AS total_quantity, c.stock_unit, c.status, c.consumed_at::text AS consumed_at,
+                b.initial_quantity::text AS initial_quantity, b.total_cost::text AS total_cost, b.currency,
+                b.remaining_quantity::text AS remaining_quantity, b.status AS batch_status
            FROM consumptions c JOIN batches b ON b.id = c.batch_id
           WHERE c.id = $1 FOR UPDATE OF c, b`,
         [request.params.id]
@@ -232,6 +275,28 @@ export async function consumptionRoutes(app: FastifyInstance): Promise<void> {
       if (!material.rowCount) throw new AppError(409, "MATERIAL_ARCHIVED", "材料已归档，不能撤销消耗恢复库存");
       const before = consumption.remaining_quantity;
       const after = addQuantities(before, consumption.total_quantity);
+      // 先确认成本链允许红冲（CONFIRMED 凭证会在此抛错，库存变动随后才执行）。
+      const costVoucher = await refreshVoucherChain(client, {
+        consumption: {
+          id: consumption.id,
+          projectId: consumption.project_id,
+          batchId: consumption.batch_id,
+          usedQuantity: consumption.used_quantity,
+          wasteQuantity: consumption.waste_quantity,
+          totalQuantity: consumption.total_quantity
+        },
+        valueDate: consumption.consumed_at.slice(0, 10),
+        batchInfo: {
+          initialQuantity: consumption.initial_quantity,
+          remainingBefore: before,
+          totalCost: consumption.total_cost,
+          currency: consumption.currency
+        },
+        actorUserId: user.id,
+        requestId: request.id,
+        action: "REVERSE",
+        reversalReason: input.reason
+      });
       await client.query(
         `INSERT INTO stock_movements(batch_id, type, signed_quantity, stock_unit, before_quantity, after_quantity,
            reference_type, reference_id, reason, actor_user_id)
@@ -251,7 +316,10 @@ export async function consumptionRoutes(app: FastifyInstance): Promise<void> {
       await writeAudit(client, {
         actorUserId: user.id, action: "REVERSE", entityType: "CONSUMPTION", entityId: consumption.id,
         beforeData: { status: "ACTIVE", remainingQuantity: before },
-        afterData: { status: "REVERSED", remainingQuantity: after, reason: input.reason },
+        afterData: {
+          status: "REVERSED", remainingQuantity: after, reason: input.reason,
+          reversalVoucherId: costVoucher.reversalVoucher?.id
+        },
         requestId: request.id
       });
       return updated.rows[0];

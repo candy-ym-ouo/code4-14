@@ -18,6 +18,7 @@ import { consumptionRoutes } from "./routes/consumptions.js";
 import { colorChangeRoutes } from "./routes/colorChanges.js";
 import { attachmentRoutes } from "./routes/attachments.js";
 import { insightRoutes } from "./routes/insights.js";
+import { costingRoutes } from "./routes/costing.js";
 
 export async function buildApp(options: { runDatabaseMigrations?: boolean } = {}): Promise<FastifyInstance> {
   if (options.runDatabaseMigrations) {
@@ -94,6 +95,7 @@ export async function buildApp(options: { runDatabaseMigrations?: boolean } = {}
     await protectedRoutes.register(consumptionRoutes);
     await protectedRoutes.register(colorChangeRoutes);
     await protectedRoutes.register(attachmentRoutes);
+    await protectedRoutes.register(costingRoutes);
     await protectedRoutes.register(insightRoutes);
   }, { prefix: "/api/v1" });
 

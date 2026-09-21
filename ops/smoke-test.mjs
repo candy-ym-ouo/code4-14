@@ -151,9 +151,83 @@ await call(`/consumptions/${consumption.id}/reverse`, { method: "POST", body: { 
 const afterReversal = await call(`/batches/${batch.id}`);
 assert(afterReversal.data.remainingQuantity === "1000.000000", "Batch balance after reversal is incorrect");
 assert(afterReversal.data.movements[0].type === "REVERSAL", "Reversal movement was not created");
+const reversedVouchers = await call(`/costing/vouchers?consumptionId=${consumption.id}&current=true`);
+const netCost = reversedVouchers.data.reduce((sum, v) => sum + Number(v.totalCostBase), 0);
+assert(netCost === 0, "Consumption and reversal current vouchers must net to zero");
 
 const search = await call(`/materials?${new URLSearchParams({ q: `Smoke Material ${suffix}`, craftType: "GENERAL", color: "Smoke Brown", stockState: "in_stock" })}`);
 assert(search.meta.total >= 1, "Material search did not find the smoke-test material");
+
+// ---- 项目用料成本核算验收 ----
+const settings = await call("/costing/settings");
+assert(settings.data.baseCurrency.length === 3, "Costing base currency missing");
+const foreignBatch = await call("/batches", {
+  method: "POST",
+  body: {
+    materialId: material.data.id,
+    batchCode: `B-FX-${suffix}`,
+    receivedAt: new Date().toISOString().slice(0, 10),
+    initialQuantity: "1000",
+    entryUnit: "g",
+    totalCost: "10.00",
+    currency: "USD"
+  }
+});
+const fxConsumption = await call("/consumptions", {
+  method: "POST",
+  body: { projectId: project.data.id, batchId: foreignBatch.data.id, usedQuantity: "450", wasteQuantity: "50", unit: "g" }
+});
+// 尚无 USD 汇率：凭证应为 DRAFT
+let vouchers = await call(`/costing/vouchers?consumptionId=${fxConsumption.data.id}&current=true`);
+let draft = vouchers.data.find((v) => v.eventType === "CONSUMPTION");
+assert(draft && draft.status === "DRAFT", "Foreign-currency voucher without rate should be DRAFT");
+
+// 登记汇率后自动重算为 ACTIVE
+const rate = await call("/costing/rates", {
+  method: "POST",
+  body: { currency: "USD", rateToBase: "7.1823", effectiveFrom: new Date().toISOString().slice(0, 10), note: "smoke" }
+});
+assert(rate.data.recompute && rate.data.recompute.created >= 1, "Rate backfill should trigger voucher recomputation");
+vouchers = await call(`/costing/vouchers?consumptionId=${fxConsumption.data.id}&current=true`);
+const active = vouchers.data.find((v) => v.eventType === "CONSUMPTION");
+assert(active.status === "ACTIVE" && Number(active.totalCostBase) > 0, "Voucher should become ACTIVE with base-currency amount");
+// 450/50 分摊：使用与损耗之和严格等于总额
+assert((Number(active.usedCostBase) + Number(active.wasteCostBase)).toFixed(2) === active.totalCostBase, "Used + waste must equal total");
+
+// 幂等重算：同样输入不应产生新版本
+const recomputeAgain = await call("/costing/recompute", { method: "POST", body: { batchId: foreignBatch.data.id } });
+assert(recomputeAgain.data.created === 0 && recomputeAgain.data.unchanged >= 1, "Repeated recomputation must be stable (no new versions)");
+
+// 批次成本补录（追加），自动产生新版本
+const adjustment = await call(`/batches/${foreignBatch.data.id}/costs`, {
+  method: "POST",
+  body: { amount: "5.00", currency: "USD", effectiveFrom: new Date().toISOString().slice(0, 10), reason: "Smoke freight backfill" }
+});
+assert(adjustment.data.recompute.created >= 1, "Cost backfill should create a new voucher version");
+
+// 补录后取最新当前版本并确认结转
+vouchers = await call(`/costing/vouchers?consumptionId=${fxConsumption.data.id}&current=true`);
+const currentVoucher = vouchers.data.find((v) => v.eventType === "CONSUMPTION");
+assert(currentVoucher.status === "ACTIVE", "Current voucher should be ACTIVE before confirmation");
+await call(`/costing/vouchers/${currentVoucher.id}/confirm`, { method: "POST", body: {} });
+const afterConfirm = await call("/costing/vouchers?consumptionId=" + fxConsumption.data.id);
+const confirmedVersion = afterConfirm.data.find((v) => v.status === "CONFIRMED");
+assert(Boolean(confirmedVersion), "Voucher should be CONFIRMED");
+const skipped = await call("/costing/recompute", { method: "POST", body: { batchId: foreignBatch.data.id } });
+assert(skipped.data.skipped >= 1, "CONFIRMED vouchers must be skipped by auto recomputation");
+
+// 历史版本链完整可查
+const detail = await call(`/costing/vouchers/${confirmedVersion.id}`);
+assert(detail.data.chain.length >= 3, "Version chain should preserve DRAFT and superseded versions");
+assert(detail.data.chain.every((v) => ["DRAFT", "ACTIVE", "CONFIRMED", "SUPERSEDED"].includes(v.status)), "Unexpected voucher status in chain");
+
+// 已确认凭证不能直接改回有效（只追加，历史不可静默改写）
+const confirmRejected = await callWithStatus(`/costing/vouchers/${confirmedVersion.id}/confirm`, { method: "POST", body: {} });
+assert(confirmRejected.status === 200, "Re-confirming an already confirmed voucher should be a no-op success");
+
+// 项目成本汇总取当前版本净额
+const costing = await call(`/projects/${project.data.id}/costing`);
+assert(costing.data.baseCurrency === settings.data.baseCurrency, "Project costing summary missing");
 
 console.log(JSON.stringify({
   result: "PASS",
@@ -161,5 +235,7 @@ console.log(JSON.stringify({
   materialId: material.data.id,
   batchId: batch.id,
   projectId: project.data.id,
-  consumptionId: consumption.id
+  consumptionId: consumption.id,
+  costVoucherChainLength: detail.data.chain.length,
+  projectTotalCostBase: costing.data.summary.total_base
 }, null, 2));

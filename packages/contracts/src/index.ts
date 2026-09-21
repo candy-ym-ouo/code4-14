@@ -60,7 +60,19 @@ export const positiveQuantity = decimalQuantity.refine((value) => compareQuantit
 export const moneyAmount = z
   .string()
   .trim()
-  .regex(/^(?:0|[1-9]\d*)(?:\.\d{1,2})?$/, "金额必须是最多 2 位小数的非负十进制数");
+  .regex(/^-?(?:0|[1-9]\d*)(?:\.\d{1,2})?$/, "金额必须是最多 2 位小数的十进制数");
+export const nonNegativeMoneyAmount = moneyAmount.refine((value) => compareMoney(value, "0") >= 0, "金额不能为负");
+export const positiveMoneyAmount = moneyAmount.refine((value) => compareMoney(value, "0") > 0, "金额必须大于 0");
+export const exchangeRateAmount = z
+  .string()
+  .trim()
+  .regex(/^(?:0|[1-9]\d*)(?:\.\d{1,10})?$/, "汇率必须是最多 10 位小数的非负十进制数")
+  .refine((value) => Number(value) > 0, "汇率必须大于 0");
+export const currencyCode = z
+  .string()
+  .trim()
+  .regex(/^[A-Za-z]{3}$/, "币种必须是 3 位字母代码")
+  .transform((value) => value.toUpperCase());
 export const colorHex = z.string().regex(/^#[0-9a-fA-F]{6}$/, "颜色必须是 #RRGGBB 格式");
 
 const QUANTITY_SCALE = 1_000_000n;
@@ -109,6 +121,136 @@ export function compareQuantities(left: string, right: string): number {
   const rightScaled = toScaled(right);
   return leftScaled === rightScaled ? 0 : leftScaled > rightScaled ? 1 : -1;
 }
+
+const MONEY_DIGITS = 2;
+const RATE_DIGITS = 10;
+const UNIT_COST_DIGITS = 10;
+const MONEY_SCALE = 10n ** BigInt(MONEY_DIGITS);
+const RATE_SCALE = 10n ** BigInt(RATE_DIGITS);
+
+function parseScaledDecimal(value: string, digits: number): bigint {
+  const match = /^(-?)(\d+)(?:\.(\d+))?$/.exec(value.trim());
+  if (!match) throw new Error("INVALID_DECIMAL");
+  const negative = match[1] === "-";
+  const fraction = (match[3] ?? "").padEnd(digits, "0").slice(0, digits);
+  let scaled = BigInt(match[2] ?? "0") * 10n ** BigInt(digits);
+  if (fraction) scaled += BigInt(fraction);
+  return negative ? -scaled : scaled;
+}
+
+function formatScaled(value: bigint, digits: number): string {
+  const negative = value < 0n;
+  const absolute = negative ? -value : value;
+  const divisor = 10n ** BigInt(digits);
+  const whole = absolute / divisor;
+  const fraction = (absolute % divisor).toString().padStart(digits, "0");
+  return `${negative ? "-" : ""}${whole}.${fraction}`;
+}
+
+export function moneyToScaled(value: string): bigint {
+  return parseScaledDecimal(value, MONEY_DIGITS);
+}
+
+export function moneyFromScaled(value: bigint): string {
+  return formatScaled(value, MONEY_DIGITS);
+}
+
+export function addMoney(left: string, right: string): string {
+  return moneyFromScaled(moneyToScaled(left) + moneyToScaled(right));
+}
+
+export function compareMoney(left: string, right: string): number {
+  const leftScaled = moneyToScaled(left);
+  const rightScaled = moneyToScaled(right);
+  return leftScaled === rightScaled ? 0 : leftScaled > rightScaled ? 1 : -1;
+}
+
+export function rateToScaled(value: string): bigint {
+  return parseScaledDecimal(value, RATE_DIGITS);
+}
+
+export function rateFromScaled(value: bigint): string {
+  return formatScaled(value, RATE_DIGITS);
+}
+
+export function unitCostFromScaled(value: bigint): string {
+  return formatScaled(value, UNIT_COST_DIGITS);
+}
+
+/** 四舍五入（半数向上）到金额最小单位（分）。 */
+export function roundMoney(value: bigint, fromScale: bigint): bigint {
+  if (fromScale === MONEY_SCALE) return value;
+  if (fromScale < MONEY_SCALE) throw new Error("INVALID_SCALE");
+  const factor = fromScale / MONEY_SCALE;
+  const half = factor / 2n;
+  if (value >= 0n) return (value + half) / factor;
+  return -((-value + half) / factor);
+}
+
+/**
+ * 按数量比例分摊金额，保证各分项之和等于总额（最后一项吸收尾差）。
+ * 输入金额为任意定点 scale，输出为该 scale 下的分摊值（不再四舍五入到分）。
+ * weights 必须全部非负且总和大于 0。
+ */
+export function allocateByWeights(total: bigint, weights: bigint[]): bigint[] {
+  const weightSum = weights.reduce((sum, weight) => sum + weight, 0n);
+  if (weightSum <= 0n) throw new Error("INVALID_ALLOCATION_WEIGHTS");
+  const results: bigint[] = [];
+  let distributed = 0n;
+  for (let index = 0; index < weights.length; index += 1) {
+    if (index === weights.length - 1) {
+      results.push(total - distributed);
+    } else {
+      const negative = total < 0n;
+      const absolute = negative ? -total : total;
+      const share = (absolute * weights[index]!) / weightSum;
+      const signed = negative ? -share : share;
+      results.push(signed);
+      distributed += signed;
+    }
+  }
+  return results;
+}
+
+/** 按汇率（rate scale 定点数）把金额换算为基准币种，结果四舍五入到分。 */
+export function convertMoney(value: bigint, rate: bigint): bigint {
+  const product = value * rate;
+  return roundMoney(product, MONEY_SCALE * RATE_SCALE);
+}
+
+export const costAdjustmentInputSchema = z.object({
+  amount: moneyAmount,
+  currency: currencyCode,
+  effectiveFrom: z.string().date(),
+  reason: z.string().trim().min(3).max(1000)
+});
+
+export const currencyRateInputSchema = z.object({
+  currency: currencyCode,
+  rateToBase: exchangeRateAmount,
+  effectiveFrom: z.string().date(),
+  note: z.string().trim().max(500).nullable().optional()
+});
+
+export const costingSettingsSchema = z.object({
+  baseCurrency: currencyCode
+});
+
+export const confirmVoucherSchema = z.object({
+  remark: z.string().trim().max(500).nullable().optional()
+});
+
+export const reopenVoucherSchema = z.object({
+  reason: z.string().trim().min(3).max(1000)
+});
+
+export const recomputeScopeSchema = z.object({
+  batchId: z.string().uuid().optional(),
+  projectId: z.string().uuid().optional()
+}).refine((value) => value.batchId || value.projectId, {
+  message: "必须指定 batchId 或 projectId",
+  path: ["batchId"]
+});
 
 export const setupSchema = z.object({
   displayName: z.string().trim().min(1).max(80),

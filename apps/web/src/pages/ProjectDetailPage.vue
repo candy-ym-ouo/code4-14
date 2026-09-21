@@ -3,7 +3,7 @@ import { computed, onMounted, reactive, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { request, ApiError } from "@/lib/api";
-import { craftTypeLabels, statusLabels, type Material } from "@/types";
+import { craftTypeLabels, statusLabels, voucherStatusLabels, voucherStatusTypes, type Material } from "@/types";
 import AttachmentPanel from "@/components/AttachmentPanel.vue";
 
 const route = useRoute();
@@ -11,6 +11,7 @@ const router = useRouter();
 const loading = ref(true);
 const saving = ref(false);
 const project = ref<any>(null);
+const costing = ref<any>(null);
 const materials = ref<Material[]>([]);
 const requirementVisible = ref(false);
 const requirementForm = reactive({ materialId: "", requiredQuantity: "", unit: "g", purpose: "", notes: "" });
@@ -19,14 +20,44 @@ const isReadOnly = computed(() => ["COMPLETED", "ARCHIVED"].includes(project.val
 async function load() {
   loading.value = true;
   try {
-    const [projectResponse, materialResponse] = await Promise.all([
+    const [projectResponse, materialResponse, costingResponse] = await Promise.all([
       request<{ data: any }>(`/projects/${route.params.id}`),
-      request<{ data: Material[] }>("/materials?pageSize=100")
+      request<{ data: Material[] }>("/materials?pageSize=100"),
+      request<{ data: any }>(`/projects/${route.params.id}/costing`).catch((error) => {
+        if (error instanceof ApiError) return null;
+        throw error;
+      })
     ]);
     project.value = projectResponse.data;
     materials.value = materialResponse.data;
+    costing.value = costingResponse?.data ?? null;
   } catch (error) { ElMessage.error(error instanceof ApiError ? error.message : "项目加载失败"); }
   finally { loading.value = false; }
+}
+
+async function confirmVoucher(row: any) {
+  try {
+    await ElMessageBox.confirm("确认后凭证视为已结转，后续成本或汇率补录不会自动改写它。", "确认成本凭证", { type: "warning" });
+    await request(`/costing/vouchers/${row.id}/confirm`, { method: "POST", body: {} });
+    ElMessage.success("凭证已确认");
+    await load();
+  } catch (error: any) {
+    if (error !== "cancel" && error !== "close") ElMessage.error(error instanceof ApiError ? error.message : "确认失败");
+  }
+}
+
+async function reopenVoucher(row: any) {
+  try {
+    const { value } = await ElMessageBox.prompt("重开会基于当前成本与汇率生成新版本，原凭证保留可追溯。", "重开已确认凭证", {
+      inputPlaceholder: "请说明重开原因（至少 3 个字）",
+      inputValidator: (input: string) => input.trim().length >= 3 || "请填写原因"
+    });
+    await request(`/costing/vouchers/${row.id}/reopen`, { method: "POST", body: { reason: value } });
+    ElMessage.success("已生成新版本凭证");
+    await load();
+  } catch (error: any) {
+    if (error !== "cancel" && error !== "close") ElMessage.error(error instanceof ApiError ? error.message : "重开失败");
+  }
 }
 function openRequirement() {
   Object.assign(requirementForm, { materialId: "", requiredQuantity: "", unit: "g", purpose: "", notes: "" });
@@ -99,6 +130,66 @@ onMounted(load);
       </section>
 
       <AttachmentPanel owner-type="PROJECT" :owner-id="project.id" :attachments="project.attachments" @changed="load" />
+
+      <section v-if="costing" class="panel">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <h2>用料成本（{{ costing.baseCurrency }}）</h2>
+          <el-tag v-if="Number(costing.summary.draft_count) > 0" type="warning">
+            {{ costing.summary.draft_count }} 张凭证待补录成本或汇率
+          </el-tag>
+        </div>
+        <el-descriptions :column="3" border size="small" style="margin:10px 0">
+          <el-descriptions-item label="使用成本">{{ costing.summary.used_base }} {{ costing.baseCurrency }}</el-descriptions-item>
+          <el-descriptions-item label="损耗分摊">{{ costing.summary.waste_base }} {{ costing.baseCurrency }}</el-descriptions-item>
+          <el-descriptions-item label="合计（有效+已确认）"><strong>{{ costing.summary.total_base }} {{ costing.baseCurrency }}</strong></el-descriptions-item>
+        </el-descriptions>
+        <el-table :data="costing.byMaterial" size="small">
+          <el-table-column label="材料" prop="materialName" min-width="160" />
+          <el-table-column label="使用成本" width="150">
+            <template #default="{ row }">{{ row.usedCostBase }} {{ costing.baseCurrency }}</template>
+          </el-table-column>
+          <el-table-column label="损耗成本" width="150">
+            <template #default="{ row }">{{ row.wasteCostBase }} {{ costing.baseCurrency }}</template>
+          </el-table-column>
+          <el-table-column label="合计" width="160">
+            <template #default="{ row }"><strong>{{ row.totalCostBase }} {{ costing.baseCurrency }}</strong></template>
+          </el-table-column>
+        </el-table>
+        <h3 style="margin:14px 0 8px">当前凭证</h3>
+        <el-table :data="costing.vouchers" size="small">
+          <el-table-column label="时间" width="160">
+            <template #default="{ row }">{{ new Date(row.createdAt).toLocaleString() }}</template>
+          </el-table-column>
+          <el-table-column label="材料/批次" min-width="160">
+            <template #default="{ row }">{{ row.materialName }}<div class="muted">{{ row.batchCode || row.batchId.slice(0, 8) }}</div></template>
+          </el-table-column>
+          <el-table-column label="类型" width="90">
+            <template #default="{ row }">
+              <el-tag size="small" :type="row.eventType === 'CONSUMPTION' ? 'primary' : 'danger'">
+                {{ row.eventType === "CONSUMPTION" ? "消耗" : "红冲" }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="原币" width="140">
+            <template #default="{ row }">{{ row.totalCostOrig }} {{ row.currency || "—" }}</template>
+          </el-table-column>
+          <el-table-column :label="`基准币`" width="130">
+            <template #default="{ row }"><strong>{{ row.totalCostBase }}</strong></template>
+          </el-table-column>
+          <el-table-column label="状态" width="120">
+            <template #default="{ row }">
+              <el-tag size="small" :type="voucherStatusTypes[row.status]">{{ voucherStatusLabels[row.status] || row.status }}</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="操作" width="150">
+            <template #default="{ row }">
+              <el-button v-if="row.status === 'ACTIVE'" link type="primary" @click="confirmVoucher(row)">确认结转</el-button>
+              <el-button v-if="row.status === 'CONFIRMED'" link type="warning" @click="reopenVoucher(row)">重开重算</el-button>
+            </template>
+          </el-table-column>
+        </el-table>
+        <el-empty v-if="costing.vouchers.length === 0" description="还没有成本凭证" />
+      </section>
 
       <div class="two-column">
         <section class="panel">
