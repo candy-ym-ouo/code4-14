@@ -3,7 +3,7 @@ import { onMounted, reactive, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { request, ApiError } from "@/lib/api";
-import { movementLabels, statusLabels, type Project } from "@/types";
+import { movementLabels, statusLabels, type CostAdjustment, type Project } from "@/types";
 import { createIdempotencyKey } from "@/lib/idempotency";
 import { localDateTimeValue } from "@/lib/dates";
 import AttachmentPanel from "@/components/AttachmentPanel.vue";
@@ -18,22 +18,60 @@ const adjustmentVisible = ref(false);
 const colorVisible = ref(false);
 const adjustment = reactive({ direction: "OUT", quantity: "", unit: "", reason: "" });
 const colorForm = reactive({ projectId: "", changeType: "OTHER", afterColorName: "", afterColorHex: "", affectedQuantity: "", unit: "", occurredAt: localDateTimeValue(), environmentNotes: "", notes: "" });
+const costAdjustments = ref<CostAdjustment[]>([]);
+const costVisible = ref(false);
+const costSaving = ref(false);
+const costForm = reactive({ feeType: "", amount: "", currency: "", incurredOn: "", notes: "" });
 
 async function load() {
   loading.value = true;
   try {
-    const [response, projectResponse] = await Promise.all([
+    const [response, projectResponse, costResponse] = await Promise.all([
       request<{ data: any }>(`/batches/${route.params.id}`),
-      request<{ data: Project[] }>("/projects?pageSize=100")
+      request<{ data: Project[] }>("/projects?pageSize=100"),
+      request<{ data: CostAdjustment[] }>(`/batches/${route.params.id}/cost-adjustments`)
     ]);
     batch.value = response.data;
     projects.value = projectResponse.data.filter((project) => ["PLANNED", "IN_PROGRESS", "COMPLETED"].includes(project.status));
+    costAdjustments.value = costResponse.data;
     adjustment.unit = response.data.stockUnit;
     colorForm.unit = response.data.stockUnit;
   } catch (error) {
     ElMessage.error(error instanceof ApiError ? error.message : "批次加载失败");
   } finally {
     loading.value = false;
+  }
+}
+
+function openCostDialog() {
+  Object.assign(costForm, {
+    feeType: "",
+    amount: "",
+    currency: batch.value?.currency || "",
+    incurredOn: new Date().toISOString().slice(0, 10),
+    notes: ""
+  });
+  costVisible.value = true;
+}
+
+async function submitCostAdjustment() {
+  if (!costForm.feeType.trim() || !costForm.amount || !costForm.currency || !costForm.incurredOn) {
+    ElMessage.error("请填写费用类型、金额、币种和发生日期");
+    return;
+  }
+  costSaving.value = true;
+  try {
+    await request(`/batches/${batch.value.id}/cost-adjustments`, {
+      method: "POST",
+      body: { ...costForm, feeType: costForm.feeType.trim(), notes: costForm.notes || null }
+    });
+    ElMessage.success("采购费用已补录，相关项目重算后生效");
+    costVisible.value = false;
+    await load();
+  } catch (error) {
+    ElMessage.error(error instanceof ApiError ? error.message : "费用补录失败");
+  } finally {
+    costSaving.value = false;
   }
 }
 
@@ -164,6 +202,22 @@ onMounted(load);
         </el-descriptions>
       </section>
 
+      <section class="panel" style="margin-top:16px">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <h2>采购费用与成本补录</h2>
+          <el-button @click="openCostDialog">补录费用</el-button>
+        </div>
+        <p class="muted">运费、关税等费用按发生日汇率折算后摊入批次成本；费用记录不可修改，如需冲正请补录一笔反向金额。</p>
+        <el-table :data="costAdjustments" size="small">
+          <el-table-column label="发生日期" prop="incurredOn" width="110" />
+          <el-table-column label="费用类型" prop="feeType" width="120" />
+          <el-table-column label="金额" width="130" align="right"><template #default="{ row }"><span :class="row.amount.startsWith('-') ? '' : 'amount'">{{ row.amount }} {{ row.currency }}</span></template></el-table-column>
+          <el-table-column label="备注" prop="notes" min-width="140"><template #default="{ row }">{{ row.notes || "—" }}</template></el-table-column>
+          <el-table-column label="录入时间" width="170"><template #default="{ row }">{{ new Date(row.createdAt).toLocaleString() }}</template></el-table-column>
+        </el-table>
+        <el-empty v-if="costAdjustments.length === 0" description="还没有采购费用记录" />
+      </section>
+
       <AttachmentPanel owner-type="BATCH" :owner-id="batch.id" :attachments="batch.attachments" @changed="load" />
 
       <div class="two-column">
@@ -189,6 +243,18 @@ onMounted(load);
         </section>
       </div>
     </template>
+
+    <el-dialog v-model="costVisible" title="补录采购费用" width="520px">
+      <el-alert title="费用将摊入批次总成本，按消耗数量占比分摊到各项目。记录保存后不可修改。" type="info" show-icon :closable="false" style="margin-bottom:16px" />
+      <el-form label-position="top">
+        <el-form-item label="费用类型" required><el-input v-model="costForm.feeType" placeholder="例如：运费、关税、手续费" maxlength="40" /></el-form-item>
+        <el-form-item label="金额（折让或退款填负数）" required><el-input v-model="costForm.amount" placeholder="例如：35.00 或 -5.00" /></el-form-item>
+        <el-form-item label="币种" required><el-input v-model="costForm.currency" placeholder="3 位币种代码，如 CNY / USD" maxlength="3" /></el-form-item>
+        <el-form-item label="发生日期（用于汇率取值）" required><el-date-picker v-model="costForm.incurredOn" type="date" value-format="YYYY-MM-DD" style="width:100%" /></el-form-item>
+        <el-form-item label="备注"><el-input v-model="costForm.notes" type="textarea" :rows="2" /></el-form-item>
+      </el-form>
+      <template #footer><el-button @click="costVisible = false">取消</el-button><el-button type="primary" :loading="costSaving" @click="submitCostAdjustment">保存</el-button></template>
+    </el-dialog>
 
     <el-dialog v-model="adjustmentVisible" title="库存调整" width="520px">
       <el-form label-position="top">

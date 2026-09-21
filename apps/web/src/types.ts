@@ -138,3 +138,105 @@ export const movementLabels: Record<string, string> = {
   ADJUSTMENT_OUT: "盘减",
   REVERSAL: "撤销恢复"
 };
+
+export type CostSettings = {
+  baseCurrency: string | null;
+  locked: boolean;
+  updatedAt: string | null;
+};
+
+export type ExchangeRate = {
+  id: string;
+  currency: string;
+  rateToBase: string;
+  effectiveOn: string;
+  notes: string | null;
+  createdAt: string;
+};
+
+export type CostAdjustment = {
+  id: string;
+  feeType: string;
+  amount: string;
+  currency: string;
+  incurredOn: string;
+  notes: string | null;
+  createdAt: string;
+};
+
+export type CostSummaryLine = {
+  consumptionId: string;
+  batchId: string;
+  materialId: string | null;
+  materialName: string | null;
+  batchCode: string | null;
+  stockUnit: string | null;
+  usedQuantity: string;
+  wasteQuantity: string;
+  currency: string | null;
+  priced: boolean;
+  batchTotalCostBase: string | null;
+  unitCostBase: string | null;
+  fxRate: string | null;
+  usedCostBase: string | null;
+  wasteCostBase: string | null;
+  totalCostBase: string | null;
+};
+
+export type CostSummary = {
+  configured: boolean;
+  baseCurrency?: string;
+  lines?: CostSummaryLine[];
+  totals?: {
+    usedCostBase: string;
+    wasteCostBase: string;
+    totalCostBase: string;
+    pricedLineCount: number;
+    unpricedLineCount: number;
+  };
+  missingRates?: { currency: string; onDate: string }[];
+  warnings?: string[];
+  voucher?: { id: string; voucherNo: string; createdAt: string; upToDate: boolean } | null;
+};
+
+export type CostVoucherListItem = {
+  id: string;
+  voucherNo: string;
+  baseCurrency: string;
+  lineCount: number;
+  pricedLineCount: number;
+  usedTotal: string;
+  wasteTotal: string;
+  grandTotal: string;
+  createdAt: string;
+  superseded: boolean;
+  supersededAt: string | null;
+  supersededByVoucherNo: string | null;
+};
+
+export type CostVoucherLine = {
+  lineNo: number;
+  consumptionId: string;
+  batchId: string;
+  batchCode: string | null;
+  materialName: string;
+  usedQuantity: string;
+  wasteQuantity: string;
+  stockUnit: string;
+  currency: string | null;
+  priced: boolean;
+  batchTotalCostBase: string | null;
+  unitCostBase: string | null;
+  fxRate: string | null;
+  usedCostBase: string | null;
+  wasteCostBase: string | null;
+  totalCostBase: string | null;
+};
+
+export type CostVoucherDetail = CostVoucherListItem & {
+  projectId: string;
+  projectName: string;
+  linesHash: string;
+  supersedesVoucherNo: string | null;
+  lines: CostVoucherLine[];
+};

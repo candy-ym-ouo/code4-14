@@ -3,7 +3,7 @@ import { computed, onMounted, reactive, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { request, ApiError } from "@/lib/api";
-import { craftTypeLabels, statusLabels, type Material } from "@/types";
+import { craftTypeLabels, statusLabels, type CostSummary, type CostVoucherDetail, type CostVoucherListItem, type Material } from "@/types";
 import AttachmentPanel from "@/components/AttachmentPanel.vue";
 
 const route = useRoute();
@@ -15,6 +15,11 @@ const materials = ref<Material[]>([]);
 const requirementVisible = ref(false);
 const requirementForm = reactive({ materialId: "", requiredQuantity: "", unit: "g", purpose: "", notes: "" });
 const isReadOnly = computed(() => ["COMPLETED", "ARCHIVED"].includes(project.value?.status));
+const costSummary = ref<CostSummary | null>(null);
+const vouchers = ref<CostVoucherListItem[]>([]);
+const recalculating = ref(false);
+const voucherDetail = ref<CostVoucherDetail | null>(null);
+const voucherVisible = ref(false);
 
 async function load() {
   loading.value = true;
@@ -25,8 +30,49 @@ async function load() {
     ]);
     project.value = projectResponse.data;
     materials.value = materialResponse.data;
+    await loadCosts();
   } catch (error) { ElMessage.error(error instanceof ApiError ? error.message : "项目加载失败"); }
   finally { loading.value = false; }
+}
+
+async function loadCosts() {
+  try {
+    const summaryResponse = await request<{ data: CostSummary }>(`/projects/${route.params.id}/cost-summary`);
+    costSummary.value = summaryResponse.data;
+    if (summaryResponse.data.configured) {
+      const voucherResponse = await request<{ data: CostVoucherListItem[] }>(`/projects/${route.params.id}/cost-vouchers`);
+      vouchers.value = voucherResponse.data;
+    }
+  } catch (error) { ElMessage.error(error instanceof ApiError ? error.message : "成本数据加载失败"); }
+}
+
+async function recalculate() {
+  recalculating.value = true;
+  try {
+    const response = await request<{ data: { unchanged: boolean; voucher: { voucherNo: string } | null; supersedesVoucherNo: string | null } }>(
+      `/projects/${route.params.id}/cost-recalculation`,
+      { method: "POST" }
+    );
+    if (response.data.unchanged) {
+      ElMessage.success(response.data.voucher ? `成本未发生变化，当前凭证 ${response.data.voucher.voucherNo} 仍然有效` : "没有需要过账的成本数据");
+    } else if (response.data.voucher) {
+      ElMessage.success(
+        response.data.supersedesVoucherNo
+          ? `已生成新凭证 ${response.data.voucher.voucherNo}，原凭证 ${response.data.supersedesVoucherNo} 已作废保留`
+          : `成本凭证 ${response.data.voucher.voucherNo} 已过账`
+      );
+    }
+    await loadCosts();
+  } catch (error) { ElMessage.error(error instanceof ApiError ? error.message : "成本重算失败"); }
+  finally { recalculating.value = false; }
+}
+
+async function openVoucher(id: string) {
+  try {
+    const response = await request<{ data: CostVoucherDetail }>(`/cost-vouchers/${id}`);
+    voucherDetail.value = response.data;
+    voucherVisible.value = true;
+  } catch (error) { ElMessage.error(error instanceof ApiError ? error.message : "凭证加载失败"); }
 }
 function openRequirement() {
   Object.assign(requirementForm, { materialId: "", requiredQuantity: "", unit: "g", purpose: "", notes: "" });
@@ -100,6 +146,57 @@ onMounted(load);
 
       <AttachmentPanel owner-type="PROJECT" :owner-id="project.id" :attachments="project.attachments" @changed="load" />
 
+      <section class="panel">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <h2>用料成本核算<span v-if="costSummary?.configured" class="muted" style="font-weight:normal">（本位币：{{ costSummary.baseCurrency }}）</span></h2>
+          <el-button v-if="costSummary?.configured" type="primary" :loading="recalculating" :disabled="(costSummary.missingRates?.length ?? 0) > 0" @click="recalculate">重算并过账</el-button>
+        </div>
+        <el-alert v-if="costSummary && !costSummary.configured" type="info" show-icon :closable="false"
+          title="尚未配置成本核算本位币">
+          <template #default>请先到<router-link to="/settings">设置</router-link>中配置本位币与汇率，之后即可按批次、用量和币种核算项目用料成本。</template>
+        </el-alert>
+        <template v-else-if="costSummary">
+          <el-alert v-if="(costSummary.missingRates?.length ?? 0) > 0" type="warning" show-icon :closable="false" style="margin-bottom:12px"
+            :title="`缺少汇率：${costSummary.missingRates!.map((item) => `${item.currency}（${item.onDate} 前生效）`).join('、')}。请在设置中补录汇率后再重算。`" />
+          <el-alert v-if="costSummary.voucher && !costSummary.voucher.upToDate" type="warning" show-icon :closable="false" style="margin-bottom:12px"
+            :title="`成本输入已变化（汇率、费用或消耗更新），当前凭证 ${costSummary.voucher.voucherNo} 不是最新。重算后将生成新凭证，历史凭证保留可查。`" />
+          <el-alert v-for="warning in costSummary.warnings ?? []" :key="warning" type="warning" show-icon :closable="false" style="margin-bottom:12px" :title="warning" />
+          <div v-if="costSummary.totals" class="stat-grid" style="margin-bottom:12px">
+            <article class="stat-card"><small>实际使用成本</small><strong>{{ costSummary.totals.usedCostBase }} {{ costSummary.baseCurrency }}</strong></article>
+            <article class="stat-card"><small>损耗成本</small><strong>{{ costSummary.totals.wasteCostBase }} {{ costSummary.baseCurrency }}</strong></article>
+            <article class="stat-card"><small>成本合计</small><strong>{{ costSummary.totals.totalCostBase }} {{ costSummary.baseCurrency }}</strong></article>
+            <article class="stat-card"><small>当前凭证</small><strong>
+              <template v-if="costSummary.voucher">{{ costSummary.voucher.voucherNo }} <el-tag size="small" :type="costSummary.voucher.upToDate ? 'success' : 'warning'">{{ costSummary.voucher.upToDate ? "最新" : "已过期" }}</el-tag></template>
+              <template v-else>尚未过账</template>
+            </strong></article>
+          </div>
+          <el-table :data="costSummary.lines ?? []" size="small">
+            <el-table-column label="材料/批次" min-width="160"><template #default="{ row }">{{ row.materialName }}<div class="muted">{{ row.batchCode || row.batchId }}</div></template></el-table-column>
+            <el-table-column label="使用/损耗" width="130"><template #default="{ row }">{{ row.usedQuantity }} / {{ row.wasteQuantity }} {{ row.stockUnit }}</template></el-table-column>
+            <el-table-column label="批次成本(本位币)" width="130" align="right"><template #default="{ row }">{{ row.priced ? row.batchTotalCostBase : "未定价" }}</template></el-table-column>
+            <el-table-column label="币种" width="70"><template #default="{ row }">{{ row.currency || "—" }}</template></el-table-column>
+            <el-table-column label="汇率" width="100" align="right"><template #default="{ row }">{{ row.fxRate ?? "—" }}</template></el-table-column>
+            <el-table-column label="使用成本" width="110" align="right"><template #default="{ row }">{{ row.usedCostBase ?? "—" }}</template></el-table-column>
+            <el-table-column label="损耗成本" width="110" align="right"><template #default="{ row }">{{ row.wasteCostBase ?? "—" }}</template></el-table-column>
+            <el-table-column label="行合计" width="110" align="right"><template #default="{ row }"><strong>{{ row.totalCostBase ?? "—" }}</strong></template></el-table-column>
+          </el-table>
+          <el-empty v-if="(costSummary.lines ?? []).length === 0" description="还没有有效消耗，暂无成本数据" />
+          <template v-if="vouchers.length > 0">
+            <h3 style="margin-top:20px">成本凭证历史</h3>
+            <el-table :data="vouchers" size="small">
+              <el-table-column label="凭证号" width="180"><template #default="{ row }"><el-button link type="primary" @click="openVoucher(row.id)">{{ row.voucherNo }}</el-button></template></el-table-column>
+              <el-table-column label="过账时间" width="170"><template #default="{ row }">{{ new Date(row.createdAt).toLocaleString() }}</template></el-table-column>
+              <el-table-column label="行数" prop="lineCount" width="70" />
+              <el-table-column label="成本合计" width="130" align="right"><template #default="{ row }">{{ row.grandTotal }} {{ row.baseCurrency }}</template></el-table-column>
+              <el-table-column label="状态" min-width="160"><template #default="{ row }">
+                <el-tag v-if="row.superseded" type="info">已作废 → {{ row.supersededByVoucherNo }}</el-tag>
+                <el-tag v-else type="success">当前有效</el-tag>
+              </template></el-table-column>
+            </el-table>
+          </template>
+        </template>
+      </section>
+
       <div class="two-column">
         <section class="panel">
           <h2>消耗记录</h2>
@@ -118,6 +215,35 @@ onMounted(load);
         </section>
       </div>
     </template>
+
+    <el-dialog v-model="voucherVisible" :title="'成本凭证 ' + (voucherDetail?.voucherNo ?? '')" width="960px">
+      <template v-if="voucherDetail">
+        <el-alert v-if="voucherDetail.superseded" type="info" show-icon :closable="false" style="margin-bottom:12px"
+          :title="`该凭证已被 ${voucherDetail.supersededByVoucherNo} 作废替代，内容保持原样仅供查阅，不会被修改。`" />
+        <el-descriptions :column="4" border size="small" style="margin-bottom:12px">
+          <el-descriptions-item label="项目">{{ voucherDetail.projectName }}</el-descriptions-item>
+          <el-descriptions-item label="过账时间">{{ new Date(voucherDetail.createdAt).toLocaleString() }}</el-descriptions-item>
+          <el-descriptions-item label="本位币">{{ voucherDetail.baseCurrency }}</el-descriptions-item>
+          <el-descriptions-item label="替代凭证">{{ voucherDetail.supersedesVoucherNo || "无" }}</el-descriptions-item>
+          <el-descriptions-item label="使用成本">{{ voucherDetail.usedTotal }}</el-descriptions-item>
+          <el-descriptions-item label="损耗成本">{{ voucherDetail.wasteTotal }}</el-descriptions-item>
+          <el-descriptions-item label="成本合计">{{ voucherDetail.grandTotal }}</el-descriptions-item>
+          <el-descriptions-item label="定价行数">{{ voucherDetail.pricedLineCount }} / {{ voucherDetail.lineCount }}</el-descriptions-item>
+        </el-descriptions>
+        <el-table :data="voucherDetail.lines" size="small" max-height="420">
+          <el-table-column label="#" prop="lineNo" width="50" />
+          <el-table-column label="材料/批次" min-width="150"><template #default="{ row }">{{ row.materialName }}<div class="muted">{{ row.batchCode || row.batchId }}</div></template></el-table-column>
+          <el-table-column label="使用/损耗" width="130"><template #default="{ row }">{{ row.usedQuantity }} / {{ row.wasteQuantity }} {{ row.stockUnit }}</template></el-table-column>
+          <el-table-column label="批次总成本" width="110" align="right"><template #default="{ row }">{{ row.batchTotalCostBase ?? "未定价" }}</template></el-table-column>
+          <el-table-column label="单位成本" width="110" align="right"><template #default="{ row }">{{ row.unitCostBase ?? "—" }}</template></el-table-column>
+          <el-table-column label="币种" width="65"><template #default="{ row }">{{ row.currency || "—" }}</template></el-table-column>
+          <el-table-column label="汇率" width="95" align="right"><template #default="{ row }">{{ row.fxRate ?? "—" }}</template></el-table-column>
+          <el-table-column label="使用成本" width="100" align="right"><template #default="{ row }">{{ row.usedCostBase ?? "—" }}</template></el-table-column>
+          <el-table-column label="损耗成本" width="100" align="right"><template #default="{ row }">{{ row.wasteCostBase ?? "—" }}</template></el-table-column>
+          <el-table-column label="行合计" width="100" align="right"><template #default="{ row }"><strong>{{ row.totalCostBase ?? "—" }}</strong></template></el-table-column>
+        </el-table>
+      </template>
+    </el-dialog>
 
     <el-dialog v-model="requirementVisible" title="添加材料需求" width="560px">
       <el-form label-position="top">

@@ -60,7 +60,9 @@ const batchPayload = {
   sourceId: source.data.id,
   receivedAt: new Date().toISOString().slice(0, 10),
   initialQuantity: "1",
-  entryUnit: "kg"
+  entryUnit: "kg",
+  totalCost: "200.00",
+  currency: "USD"
 };
 const [batchResult, repeatedBatchResult] = await Promise.all([
   callWithStatus("/batches", {
@@ -151,6 +153,91 @@ await call(`/consumptions/${consumption.id}/reverse`, { method: "POST", body: { 
 const afterReversal = await call(`/batches/${batch.id}`);
 assert(afterReversal.data.remainingQuantity === "1000.000000", "Batch balance after reversal is incorrect");
 assert(afterReversal.data.movements[0].type === "REVERSAL", "Reversal movement was not created");
+
+// ---- 成本核算验收：分摊、重算稳定、凭证不可变 ----
+const today = new Date();
+const todayStr = today.toISOString().slice(0, 10);
+const yesterdayStr = new Date(today.getTime() - 86_400_000).toISOString().slice(0, 10);
+const fmtCents = (cents) => (cents / 100).toFixed(2);
+const expectedLineCents = (rate, quantity) => Math.round(Math.round(20000 * rate + 3500 - 500) * quantity / 1000);
+
+const costSettings = await call("/settings/cost");
+if (!costSettings.data.baseCurrency) {
+  await call("/settings/cost", { method: "PUT", body: { baseCurrency: "CNY" } });
+}
+assert((await call("/settings/cost")).data.baseCurrency === "CNY", "Base currency is not CNY");
+
+const existingUsdRates = await call("/exchange-rates?currency=USD&pageSize=100");
+if (!existingUsdRates.data.some((rate) => rate.effectiveOn === yesterdayStr)) {
+  await call("/exchange-rates", { method: "POST", body: { currency: "USD", rateToBase: "7", effectiveOn: yesterdayStr, notes: "smoke base rate" } });
+}
+
+await call(`/batches/${batch.id}/cost-adjustments`, { method: "POST", body: { feeType: "运费", amount: "35.00", currency: "CNY", incurredOn: todayStr } });
+await call(`/batches/${batch.id}/cost-adjustments`, { method: "POST", body: { feeType: "折让", amount: "-5.00", currency: "CNY", incurredOn: todayStr } });
+const adjustments = await call(`/batches/${batch.id}/cost-adjustments`);
+assert(adjustments.data.length === 2, "Batch cost adjustments were not recorded");
+
+const costConsumption = await call("/consumptions", {
+  method: "POST",
+  body: { projectId: project.data.id, batchId: batch.id, usedQuantity: "90", wasteQuantity: "10", unit: "g", purpose: "Cost verification" }
+});
+
+const summary = await call(`/projects/${project.data.id}/cost-summary`);
+assert(summary.data.configured === true, "Cost summary is not configured");
+const summaryLine = summary.data.lines.find((line) => line.consumptionId === costConsumption.data.id);
+assert(summaryLine && summaryLine.priced, "Cost summary line is not priced");
+const appliedRate = Number(summaryLine.fxRate);
+assert(summaryLine.usedCostBase === fmtCents(expectedLineCents(appliedRate, 90)), "Used cost allocation is incorrect");
+assert(summaryLine.wasteCostBase === fmtCents(expectedLineCents(appliedRate, 10)), "Waste cost allocation is incorrect");
+assert(summary.data.totals.totalCostBase === fmtCents(expectedLineCents(appliedRate, 90) + expectedLineCents(appliedRate, 10)), "Cost totals are incorrect");
+
+const firstRecalc = await call(`/projects/${project.data.id}/cost-recalculation`, { method: "POST" });
+assert(firstRecalc.data.unchanged === false && firstRecalc.data.voucher, "First recalculation did not post a voucher");
+const firstVoucherNo = firstRecalc.data.voucher.voucherNo;
+const repeatRecalc = await call(`/projects/${project.data.id}/cost-recalculation`, { method: "POST" });
+assert(repeatRecalc.data.unchanged === true, "Recalculation with unchanged inputs was not stable");
+
+// 汇率补录后重算：生成新凭证，旧凭证显式作废且内容不变
+const bumpedRate = (appliedRate + 0.25).toFixed(2);
+let backfilled = false;
+try {
+  await call("/exchange-rates", { method: "POST", body: { currency: "USD", rateToBase: bumpedRate, effectiveOn: todayStr, notes: "smoke backfilled rate" } });
+  backfilled = Number(bumpedRate) !== appliedRate;
+} catch (error) {
+  if (!String(error.message).includes("EXCHANGE_RATE_EXISTS")) throw error;
+}
+if (backfilled) {
+  const secondRecalc = await call(`/projects/${project.data.id}/cost-recalculation`, { method: "POST" });
+  assert(secondRecalc.data.unchanged === false, "Recalculation after rate backfill did not post a new voucher");
+  assert(secondRecalc.data.supersedesVoucherNo === firstVoucherNo, "Old voucher was not superseded");
+  const vouchers = await call(`/projects/${project.data.id}/cost-vouchers`);
+  const oldVoucher = vouchers.data.find((voucher) => voucher.voucherNo === firstVoucherNo);
+  assert(oldVoucher && oldVoucher.superseded === true, "Old voucher is not marked as superseded");
+  const oldDetail = await call(`/cost-vouchers/${oldVoucher.id}`);
+  assert(oldDetail.data.grandTotal === fmtCents(expectedLineCents(appliedRate, 90) + expectedLineCents(appliedRate, 10)), "Historical voucher content was silently rewritten");
+  const newRate = appliedRate + 0.25;
+  assert(secondRecalc.data.totals.totalCostBase === fmtCents(expectedLineCents(newRate, 90) + expectedLineCents(newRate, 10)), "New voucher total does not reflect the backfilled rate");
+}
+
+// 缺汇率时重算必须拒绝且不影响已有凭证
+const eurBatch = await call("/batches", {
+  method: "POST",
+  body: { materialId: material.data.id, batchCode: `B-EUR-${suffix}`, receivedAt: todayStr, initialQuantity: "100", entryUnit: "g", totalCost: "50.00", currency: "EUR" }
+});
+const eurConsumption = await call("/consumptions", {
+  method: "POST",
+  body: { projectId: project.data.id, batchId: eurBatch.data.id, usedQuantity: "10", wasteQuantity: "0", unit: "g" }
+});
+let missingRateRejected = false;
+try {
+  await call(`/projects/${project.data.id}/cost-recalculation`, { method: "POST" });
+} catch (error) {
+  missingRateRejected = String(error.message).includes("MISSING_EXCHANGE_RATE");
+}
+assert(missingRateRejected, "Recalculation did not reject missing exchange rates");
+await call(`/consumptions/${eurConsumption.data.id}/reverse`, { method: "POST", body: { reason: "Smoke test cleanup" } });
+const finalRecalc = await call(`/projects/${project.data.id}/cost-recalculation`, { method: "POST" });
+assert(finalRecalc.data.unchanged === true, "Final recalculation should find the current voucher up to date");
 
 const search = await call(`/materials?${new URLSearchParams({ q: `Smoke Material ${suffix}`, craftType: "GENERAL", color: "Smoke Brown", stockState: "in_stock" })}`);
 assert(search.meta.total >= 1, "Material search did not find the smoke-test material");

@@ -16,6 +16,7 @@ import { batchRoutes } from "./routes/batches.js";
 import { projectRoutes } from "./routes/projects.js";
 import { consumptionRoutes } from "./routes/consumptions.js";
 import { colorChangeRoutes } from "./routes/colorChanges.js";
+import { costRoutes } from "./routes/costs.js";
 import { attachmentRoutes } from "./routes/attachments.js";
 import { insightRoutes } from "./routes/insights.js";
 
@@ -93,6 +94,7 @@ export async function buildApp(options: { runDatabaseMigrations?: boolean } = {}
     await protectedRoutes.register(projectRoutes);
     await protectedRoutes.register(consumptionRoutes);
     await protectedRoutes.register(colorChangeRoutes);
+    await protectedRoutes.register(costRoutes);
     await protectedRoutes.register(attachmentRoutes);
     await protectedRoutes.register(insightRoutes);
   }, { prefix: "/api/v1" });
